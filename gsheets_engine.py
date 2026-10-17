@@ -1,0 +1,529 @@
+# gsheets_engine.py — модуль для работы с Google Таблицей расписания отслушек.
+#
+# Этот файл является ЗАМЕНОЙ excel_engine.py (который работал с локальным .xlsx).
+# Все функции имеют ТЕ ЖЕ САМЫЕ имена и сигнатуры, что и в excel_engine.py,
+# чтобы handlers.py не требовал изменений.
+#
+# ВАЖНО: теперь данные хранятся НЕ в локальном Excel, а в Google Таблице.
+# Подключение через Service Account (библиотека gspread).
+
+import datetime
+import json
+import logging
+import os
+import re
+import threading
+from zoneinfo import ZoneInfo
+
+import gspread
+from google.oauth2.service_account import Credentials
+
+from config import (
+    DATE_COLUMN, DATE_ROW, FIRST_SLOT_ROW, MAX_TASKS,
+    NAME_COLUMN, SCHEDULE_CUTOFF_HOUR, SERVICE_ACCOUNT_FILE,
+    SLOT_STEP, SPREADSHEET_ID, TASKS_COLUMN, TIME_COLUMN, WEEKDAY_NUMBERS,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ExcelEngineError(Exception):
+    """Наше собственное исключение — проблема при работе с Google Таблицей."""
+
+
+_client = None
+_spreadsheet = None
+_FILE_LOCK = threading.Lock()
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        try:
+            # На Amvera ключ сервисного аккаунта передаётся через переменную
+            # окружения GOOGLE_CREDENTIALS_JSON (JSON-строка целиком).
+            # Локально (переменной нет) по-прежнему читаем файл
+            # SERVICE_ACCOUNT_FILE — локальная работа не ломается.
+            credentials_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+            if credentials_json:
+                creds = Credentials.from_service_account_info(
+                    json.loads(credentials_json),
+                    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+                )
+            else:
+                creds = Credentials.from_service_account_file(
+                    SERVICE_ACCOUNT_FILE,
+                    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+                )
+            _client = gspread.authorize(creds)
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Не удалось авторизоваться в Google Sheets: {error}"
+            ) from error
+    return _client
+
+
+def _get_spreadsheet():
+    global _spreadsheet
+    if _spreadsheet is None:
+        try:
+            client = _get_client()
+            _spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Не удалось открыть Google Таблицу: {error}"
+            ) from error
+    return _spreadsheet
+
+
+def _open_worksheet(sheet_name):
+    try:
+        return _get_spreadsheet().worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        raise ExcelEngineError(f"Лист '{sheet_name}' не найден в Google Таблице.")
+    except Exception as error:
+        raise ExcelEngineError(
+            f"Ошибка при открытии листа '{sheet_name}': {error}"
+        ) from error
+
+
+def _invalidate_cache():
+    global _spreadsheet
+    _spreadsheet = None
+
+
+def _extract_time_from_formula(formula):
+    if not isinstance(formula, str):
+        return None
+    match = re.search(r'"(\d{1,2}:\d{2}[^"]*)"', formula)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _get_slot_time(worksheet, row):
+    try:
+        value = worksheet.cell(row, TIME_COLUMN).value
+    except Exception:
+        return None
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.startswith("="):
+            return _extract_time_from_formula(value)
+        if ":" in value:
+            return value.strip()
+    return None
+
+
+def _is_schedule_sheet(worksheet):
+    try:
+        # ВАЖНО: читаем ячейку с датой в режиме FORMULA — gspread по умолчанию
+        # возвращает отформатированное значение (например "20.10.2026"), а нам
+        # нужно проверить, что в ячейке лежит ФОРМУЛА (начинается с "=").
+        # Так мы отличаем листы-дни расписания от служебных листов.
+        value = worksheet.cell(
+            DATE_ROW, DATE_COLUMN, value_render_option="FORMULA"
+        ).value
+        return isinstance(value, str) and value.startswith("=")
+    except Exception:
+        return False
+
+
+def _compute_date(worksheet, sheet_name):
+    if not _is_schedule_sheet(worksheet):
+        return None
+    weekday_number = WEEKDAY_NUMBERS.get(sheet_name.strip())
+    if weekday_number is None:
+        return None
+    # ВАЖНО: сервер Amvera работает в UTC, а расписание — в часовом поясе
+    # Екатеринбурга (UTC+5). Считаем «текущее время» в явной таймзоне,
+    # чтобы день и SCHEDULE_CUTOFF_HOUR определялись по местному времени.
+    # Python 3.10+: ZoneInfo из стандартной библиотеки (zoneinfo).
+    now = datetime.datetime.now(ZoneInfo("Asia/Yekaterinburg"))
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_until = (weekday_number - 1 - today.weekday()) % 7
+    base_date = today + datetime.timedelta(days=days_until)
+    if base_date < today:
+        base_date += datetime.timedelta(days=7)
+    if now.hour >= SCHEDULE_CUTOFF_HOUR and base_date <= today:
+        base_date += datetime.timedelta(days=7)
+    return base_date.strftime("%d.%m.%Y")
+
+
+def _parse_slots(worksheet):
+    """Парсит лист и возвращает список слотов (та же структура, что в excel_engine.py)."""
+    slots = []
+    row = FIRST_SLOT_ROW
+    try:
+        all_values = worksheet.get_all_values(value_render_option="FORMULA")
+    except Exception as error:
+        raise ExcelEngineError(f"Не удалось прочитать лист: {error}") from error
+
+    max_row = len(all_values)
+    while row <= max_row:
+        time_text = None
+        if row - 1 < len(all_values):
+            row_data = all_values[row - 1]
+            if len(row_data) > TIME_COLUMN - 1:
+                cell = row_data[TIME_COLUMN - 1]
+                if isinstance(cell, str) and ":" in cell:
+                    if cell.startswith("="):
+                        time_text = _extract_time_from_formula(cell)
+                    else:
+                        time_text = cell.strip()
+                elif isinstance(cell, str) and cell.startswith("="):
+                    time_text = _extract_time_from_formula(cell)
+
+        if time_text is None:
+            break
+
+        students = []
+        for offset in range(1, SLOT_STEP):
+            idx = row - 1 + offset
+            if idx >= len(all_values):
+                break
+            r = all_values[idx]
+            name_val = r[NAME_COLUMN - 1] if len(r) > NAME_COLUMN - 1 else ""
+            if name_val and str(name_val).strip():
+                students.append(str(name_val).strip())
+
+        slots.append({
+            "time": time_text,
+            "header_row": row,
+            "students": students,
+            "free": len(students) == 0,
+        })
+        row += SLOT_STEP
+
+    return slots
+
+
+# ---------------------------------------------------------------------------
+# Основные функции (публичный API).
+# ---------------------------------------------------------------------------
+
+
+def get_available_days():
+    """Возвращает список всех дней (листов) с датами из Google Таблицы."""
+    try:
+        worksheets = _get_spreadsheet().worksheets()
+        days = []
+        for ws in worksheets:
+            date_text = _compute_date(ws, ws.title)
+            if date_text is not None:
+                days.append({"sheet": ws.title, "date": date_text})
+        return days
+    except ExcelEngineError:
+        raise
+    except Exception as error:
+        raise ExcelEngineError(f"Ошибка при получении списка дней: {error}") from error
+
+
+def get_slots_for_day(sheet):
+    """Возвращает все слоты указанного дня (и свободные, и занятые)."""
+    with _FILE_LOCK:
+        try:
+            worksheet = _open_worksheet(sheet)
+            return _parse_slots(worksheet)
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Ошибка при получении слотов для '{sheet}': {error}"
+            ) from error
+
+
+def book_slot(sheet, header_row, nickname, tasks=0):
+    """Записывает ученика на конкретный слот. True при успехе, False — если слот занят."""
+    with _FILE_LOCK:
+        try:
+            worksheet = _open_worksheet(sheet)
+
+            # Проверяем корректность номера строки блока.
+            if not isinstance(header_row, int) or header_row < FIRST_SLOT_ROW:
+                return False
+            if (header_row - FIRST_SLOT_ROW) % SLOT_STEP != 0:
+                return False
+            if _get_slot_time(worksheet, header_row) is None:
+                return False
+
+            # Читаем колонку B блока (строки header_row+1 … header_row+SLOT_STEP-1).
+            # ВАЖНО: используем range(), а не get()/batch_get() — Google API
+            # возвращает ПУСТОЙ список для диапазона, где все ячейки пустые,
+            # а range() всегда возвращает все ячейки диапазона.
+            body_range = f"B{header_row + 1}:B{header_row + SLOT_STEP - 1}"
+            try:
+                body_cells = worksheet.range(body_range)
+            except Exception:
+                body_cells = []
+
+            # Ищем первую пустую строку и одновременно проверяем, свободен ли слот.
+            first_empty_row = None
+            for idx, cell in enumerate(body_cells):
+                student_value = cell.value
+                if student_value is None or not str(student_value).strip():
+                    if first_empty_row is None:
+                        first_empty_row = header_row + 1 + idx
+                else:
+                    # В блоке уже есть ученик — слот занят, бронь невозможна.
+                    return False
+
+            # Если пустой строки нет — весь блок занят (или сломан).
+            if first_empty_row is None:
+                return False
+
+            # Слот свободен: пишем ник в первую пустую строку блока (колонка B).
+            worksheet.update_cell(first_empty_row, NAME_COLUMN, nickname)
+
+            # Если указано количество задач — пишем его в колонку C (TASKS_COLUMN).
+            if 1 <= tasks <= MAX_TASKS:
+                worksheet.update_cell(first_empty_row, TASKS_COLUMN, tasks)
+
+            return True
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Ошибка при бронировании слота '{sheet}': {error}"
+            ) from error
+
+
+# ---------------------------------------------------------------------------
+# ФУНКЦИИ ДЛЯ АДМИНИСТРАТОРА.
+# Всё, что касается управления расписанием (сброс, изменение времени, просмотр
+# записей), собрано здесь. Логика работы с таблицей остаётся в этом модуле —
+# handlers.py только вызывает эти функции (как и в случае с бронированием).
+# ---------------------------------------------------------------------------
+
+
+def _validate_header_row(worksheet, header_row):
+    """Проверяет, что header_row — корректный номер строки-заголовка блока слота.
+
+    Правила (те же, что и при бронировании):
+      - это целое число не меньше FIRST_SLOT_ROW;
+      - отстоит от FIRST_SLOT_ROW на целое число шагов SLOT_STEP;
+      - в этой строке реально записано время слота.
+    Такая защита не даёт «сбросить» или «переименовать» что-то не то.
+    """
+    if not isinstance(header_row, int) or header_row < FIRST_SLOT_ROW:
+        return False
+    if (header_row - FIRST_SLOT_ROW) % SLOT_STEP != 0:
+        return False
+    return _get_slot_time(worksheet, header_row) is not None
+
+
+def _clear_slot_students(worksheet, header_row):
+    """Очищает всех учеников одного блока слота (колонка B от header_row+1 до
+    header_row+SLOT_STEP-1). Возвращает количество удалённых записей.
+
+    Функция НЕ сохраняет ничего отдельно — запись в Google Таблицу происходит
+    сразу (каждая ячейка обновляется на сервере), поэтому вызывающий код
+    просто получает количество удалённых записей.
+    """
+    removed = 0
+    body_range = f"B{header_row + 1}:B{header_row + SLOT_STEP - 1}"
+    try:
+        body_cells = worksheet.range(body_range)
+    except Exception:
+        body_cells = []
+
+    cells_to_clear = []
+    for idx, cell in enumerate(body_cells):
+        student_value = cell.value
+        if student_value is not None and str(student_value).strip():
+            cells_to_clear.append(header_row + 1 + idx)
+            removed += 1
+
+    if cells_to_clear:
+        # Очищаем найденные ячейки (пишем пустую строку вместо ника).
+        # ВАЖНО: в gspread 6.x batch_update принимает список СЛОВАРЕЙ
+        # {"range": ..., "values": ...}, а не кортежей (как в 5.x).
+        worksheet.batch_update(
+            [{"range": f"B{row}", "values": [[""]]} for row in cells_to_clear]
+        )
+    return removed
+
+
+def get_all_records():
+    """Админ-функция: возвращает ВСЕ записи (кто на какой слот записан).
+
+    Формат результата — список словарей:
+        [
+            {"sheet": "Вторник", "date": "20.10.2026",
+             "students": [{"time": "17:00 — 17:15", "name": "@ivan"}, ...]},
+            ...
+        ]
+    Дни без единой записи в список не попадают.
+    """
+    with _FILE_LOCK:
+        try:
+            records = []
+            for worksheet in _get_spreadsheet().worksheets():
+                date_text = _compute_date(worksheet, worksheet.title)
+                if date_text is None:
+                    continue  # не день расписания
+
+                # Собираем построчно: время слота + ник ученика.
+                booked = []
+                for slot in _parse_slots(worksheet):
+                    for student in slot["students"]:
+                        booked.append({"time": slot["time"], "name": student})
+
+                if booked:
+                    records.append(
+                        {
+                            "sheet": worksheet.title,
+                            "date": date_text,
+                            "students": booked,
+                        }
+                    )
+            return records
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(f"Ошибка при получении всех записей: {error}") from error
+
+
+def reset_all_slots():
+    """Админ-функция: ПОЛНЫЙ СБРОС — стирает всех учеников во ВСЕХ днях расписания.
+
+    Возвращает общее количество удалённых записей.
+    """
+    with _FILE_LOCK:
+        try:
+            total_removed = 0
+            for worksheet in _get_spreadsheet().worksheets():
+                if _compute_date(worksheet, worksheet.title) is None:
+                    continue  # служебный лист — не трогаем
+                for slot in _parse_slots(worksheet):
+                    total_removed += _clear_slot_students(
+                        worksheet, slot["header_row"]
+                    )
+            return total_removed
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(f"Ошибка при полном сбросе: {error}") from error
+
+
+def reset_slot(sheet, header_row):
+    """Админ-функция: сбрасывает ОДИН конкретный слот (освобождает его).
+
+    Параметры: sheet — имя листа-дня, header_row — номер строки блока слота.
+    Возвращает количество удалённых записей (0 — если слот и так был пуст,
+    -1 — если блок некорректен).
+    """
+    with _FILE_LOCK:
+        try:
+            worksheet = _open_worksheet(sheet)
+
+            if not _validate_header_row(worksheet, header_row):
+                return -1  # некорректный номер блока
+
+            return _clear_slot_students(worksheet, header_row)
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Ошибка при сбросе слота '{sheet}': {error}"
+            ) from error
+
+
+def update_slot_time(sheet, header_row, new_time):
+    """Админ-функция: изменяет ВРЕМЯ слота (текст в колонке C строки-заголовка).
+
+    Параметры:
+        sheet      — имя листа-дня,
+        header_row — номер строки блока слота,
+        new_time   — новый текст времени (например "17:00 — 17:15").
+
+    Возвращает True при успехе, False — если блок некорректен.
+    ВАЖНО: в таблице время хранится формулой. Мы перезаписываем ячейку обычным
+    текстом — это осознанно: так новое время гарантированно сохранится и будет
+    читаться ботом и в Google Таблице.
+    """
+    with _FILE_LOCK:
+        try:
+            worksheet = _open_worksheet(sheet)
+
+            if not _validate_header_row(worksheet, header_row):
+                return False
+
+            # Пишем новое время обычным текстом в колонку C строки-заголовка.
+            worksheet.update_cell(header_row, TIME_COLUMN, new_time)
+            return True
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Ошибка при изменении времени слота '{sheet}': {error}"
+            ) from error
+
+
+# ---------------------------------------------------------------------------
+# Поиск существующих записей пользователя (защита от двойной записи).
+# ---------------------------------------------------------------------------
+
+
+def find_user_bookings(nickname):
+    """Ищет все слоты, в которых записан пользователь с указанным ником.
+
+    Проходит по всем листам-дням и проверяет всех учеников в каждом слоте.
+    Если ник найден — возвращает список словарей:
+        [
+            {"sheet": "Вторник", "date": "20.10.2026",
+             "time": "17:00 — 17:15", "header_row": 6},
+            ...
+        ]
+    Если записей нет — возвращает пустой список [].
+
+    Используется в handlers.py перед бронированием, чтобы запретить
+    повторную запись одного и того же ученика.
+    """
+    with _FILE_LOCK:
+        try:
+            results = []
+            nickname_lower = nickname.strip().lower()
+
+            for worksheet in _get_spreadsheet().worksheets():
+                date_text = _compute_date(worksheet, worksheet.title)
+                if date_text is None:
+                    continue  # не день расписания
+
+                for slot in _parse_slots(worksheet):
+                    if isinstance(slot["students"], list):
+                        for student in slot["students"]:
+                            if student.strip().lower() == nickname_lower:
+                                results.append({
+                                    "sheet": worksheet.title,
+                                    "date": date_text,
+                                    "time": slot["time"],
+                                    "header_row": slot["header_row"],
+                                })
+                                # Продолжаем сканировать — вдруг тот же ник
+                                # попал в несколько слотов (ошибка админа).
+            return results
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Ошибка при поиске записей пользователя: {error}"
+            ) from error
+
+
+# Блок ниже выполняется ТОЛЬКО если запустить этот файл напрямую:
+#     python gsheets_engine.py
+# Он не срабатывает при обычном импорте. Удобно для быстрой проверки.
+if __name__ == "__main__":
+    days = get_available_days()
+    print("Дни в расписании:")
+    for day in days:
+        print(f"  - {day['sheet']} ({day['date']})")
+
+    if days:
+        first = days[0]
+        print(f"\nСлоты дня '{first['sheet']}':")
+        for slot in get_slots_for_day(first["sheet"]):
+            status = "свободен" if slot["free"] else f"занят ({len(slot['students'])} уч.)"
+            print(f"  - {slot['time']}: {status}")

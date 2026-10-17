@@ -1,0 +1,25 @@
+# --- Python ---
+venv/
+__pycache__/
+
+# --- Файлы данных / Excel ---
+*.xlsx
+
+# --- Текстовые файлы (кроме README и requirements.txt) ---
+*.txt
+!README*
+!requirements.txt
+
+# --- Тестовые и вспомогательные скрипты ---
+test_*.py
+quick_*.py
+inspect_*.py
+make_test_*.py
+check_*.py
+debug_*.py
+sync_excel_to_gsheets.py
+apply_*.py
+
+# --- Секреты ---
+avid-heading-344320-a92c26eac17f.json
+admin_ids.json
