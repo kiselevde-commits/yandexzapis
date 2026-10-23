@@ -7,6 +7,7 @@
 #   /start → список ДНЕЙ → выбор дня → список СЛОТОВ этого дня →
 #   выбор свободного слота → ввод ника → запись в базу PostgreSQL → возврат к списку дней.
 
+import asyncio
 import json     # для сохранения/загрузки списка администраторов
 import logging
 import os       # для проверки существования файла
@@ -22,7 +23,8 @@ logger = logging.getLogger(__name__)
 # Настройки администраторов (кто имеет доступ к админ-меню).
 from commands import set_admin_commands_for_chat
 from config import ADMIN_ALLOW_CHAT_ADMINS, ADMIN_IDS, ADMIN_IDS_FILE
-from postgres_engine import (
+from db_engine import (
+    DatabaseError,
     ExcelEngineError,
     book_slot,
     cancel_booking,
@@ -31,6 +33,7 @@ from postgres_engine import (
     get_available_days,
     get_slots_for_day,
     get_statistics,
+    init_db,
     reset_all_slots,
     reset_slot,
     update_slot_time,
@@ -75,9 +78,8 @@ EXCEL_ERROR_TEXT = (
 
 
 # ---------------------------------------------------------------------------
-# Безопасные асинхронные обёртки функций PostgreSQL.
-# postgres_engine.py уже асинхронный, поэтому просто вызываем функции напрямую
-# и ловим исключения DatabaseError.
+# Безопасные асинхронные обёртки функций БД.
+# db_engine.py уже предоставляет асинхронные функции, поэтому просто вызываем их.
 # ---------------------------------------------------------------------------
 
 
