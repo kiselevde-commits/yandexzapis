@@ -1,0 +1,22 @@
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: 3.10
+build:
+  requirementsPath: requirements.txt
+  useCache: true
+run:
+  scriptName: bot.py
+  persistenceMount: /data
+  env:
+    - name: BOT_TOKEN
+      value: ""
+    - name: DATABASE_URL
+      value: ""
+    - name: ADMIN_IDS_FILE
+      value: "/data/admin_ids.json"
+    - name: DATA_DIR
+      value: "/data"
+    - name: PORT
+      value: "10000"
