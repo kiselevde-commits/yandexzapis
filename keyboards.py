@@ -6,6 +6,8 @@
 #
 # В aiogram 3.x для сборки инлайн-клавиатур удобно использовать InlineKeyboardBuilder.
 
+from typing import Final
+
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -13,28 +15,33 @@ from config import MAX_TASKS
 
 # Префиксы callback_data — короткие строки, которые Telegram присылает боту при нажатии.
 # По ним в handlers.py мы понимаем, что именно нажали.
-DAY_PREFIX = "day"          # нажата кнопка выбора дня
-SLOT_PREFIX = "slot"        # нажата кнопка выбора времени
-OCCUPIED_DATA = "occupied"  # нажата кнопка ЗАНЯТОГО слота (просто покажем подсказку)
-BACK_TO_DAYS = "back_to_days"  # кнопка «назад к выбору дня»
+DAY_PREFIX: Final[str] = "day"          # нажата кнопка выбора дня
+SLOT_PREFIX: Final[str] = "slot"        # нажата кнопка выбора времени
+OCCUPIED_DATA: Final[str] = "occupied"  # нажата кнопка ЗАНЯТОГО слота (просто покажем подсказку)
+BACK_TO_DAYS: Final[str] = "back_to_days"  # кнопка «назад к выбору дня»
 
 # --- Префиксы для АДМИН-МЕНЮ -------------------------------------------------
-ADMIN_PREFIX = "adm"            # общий префикс админ-кнопок "adm:действие"
-ADMIN_VIEW_RECORDS = "adm:view"      # просмотр — кто записался
-ADMIN_RESET_ALL = "adm:reset_all"    # полный сброс всех слотов (запрос подтверждения)
-ADMIN_RESET_CHOOSE = "adm:reset"     # выбрать слот для сброса
-ADMIN_EDIT_CHOOSE = "adm:edit"       # выбрать слот для изменения времени
-ADMIN_CONFIRM_ALL = "adm:confirm_all"  # подтвердить полный сброс
-ADMIN_CANCEL = "adm:cancel"          # отмена действия
-ADMIN_CLOSE = "adm:close"            # закрыть админ-меню
-ADMIN_ADD = "adm:add_admin"         # назначить нового администратора
+ADMIN_PREFIX: Final[str] = "adm"            # общий префикс админ-кнопок "adm:действие"
+ADMIN_VIEW_RECORDS: Final[str] = "adm:view"      # просмотр — кто записался
+ADMIN_RESET_ALL: Final[str] = "adm:reset_all"    # полный сброс всех слотов (запрос подтверждения)
+ADMIN_RESET_CHOOSE: Final[str] = "adm:reset"     # выбрать слот для сброса
+ADMIN_EDIT_CHOOSE: Final[str] = "adm:edit"       # выбрать слот для изменения времени
+ADMIN_CONFIRM_ALL: Final[str] = "adm:confirm_all"  # подтвердить полный сброс
+ADMIN_CANCEL: Final[str] = "adm:cancel"          # отмена действия
+ADMIN_CLOSE: Final[str] = "adm:close"            # закрыть админ-меню
+ADMIN_ADD: Final[str] = "adm:add_admin"         # назначить нового администратора
+ADMIN_STATS: Final[str] = "adm:stats"           # статистика
 
 # --- Префикс для выбора количества задач ------------------------------------
-TASKS_PREFIX = "tasks"              # нажата кнопка выбора количества задач
-TASKS_CANCEL = "tasks:cancel"       # отмена выбора задач (возврат к дням)
+TASKS_PREFIX: Final[str] = "tasks"              # нажата кнопка выбора количества задач
+TASKS_CANCEL: Final[str] = "tasks:cancel"       # отмена выбора задач (возврат к дням)
 
-DAYS_PER_ROW = 2   # сколько кнопок дней в одной строке
-SLOTS_PER_ROW = 2  # сколько кнопок слотов в одной строке
+# --- Префиксы для управления записями пользователя -------------------------
+CANCEL_PREFIX: Final[str] = "cancel"            # отмена записи пользователя
+EDIT_TASKS_PREFIX: Final[str] = "edit_tasks"    # изменение количества задач
+
+DAYS_PER_ROW: Final[int] = 2   # сколько кнопок дней в одной строке
+SLOTS_PER_ROW: Final[int] = 2  # сколько кнопок слотов в одной строке
 
 
 def build_days_keyboard(days: list[dict]) -> InlineKeyboardMarkup:
@@ -107,14 +114,17 @@ def build_admin_menu_keyboard() -> InlineKeyboardMarkup:
     Главное меню администратора.
 
     Кнопки:
-        👥 Кто записался — просмотр всех записей,
+        � Статистика — общая статистика по расписанию,
+        �👥 Кто записался — просмотр всех записей,
         🗑 Сбросить слот — освободить один слот,
         ✏️ Изменить время — поменять время одного слота,
         ♻️ Полный сброс — освободить ВСЕ слоты (с подтверждением),
+        👑 Назначить администратора — добавить нового админа,
         ❌ Закрыть — убрать меню.
     """
     builder = InlineKeyboardBuilder()
 
+    builder.button(text="📊 Статистика", callback_data=ADMIN_STATS)
     builder.button(text="👥 Кто записался", callback_data=ADMIN_VIEW_RECORDS)
     builder.button(text="🗑 Сбросить слот", callback_data=ADMIN_RESET_CHOOSE)
     builder.button(text="✏️ Изменить время", callback_data=ADMIN_EDIT_CHOOSE)
@@ -123,7 +133,7 @@ def build_admin_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="❌ Закрыть", callback_data=ADMIN_CLOSE)
 
     # По 1–2 кнопки в ряд для аккуратного вида.
-    builder.adjust(1, 1, 1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -208,4 +218,39 @@ def build_tasks_keyboard() -> InlineKeyboardMarkup:
 
     builder.button(text="⬅️ Отмена", callback_data=TASKS_CANCEL)
     builder.adjust(2, 2)
+    return builder.as_markup()
+
+
+# ---------------------------------------------------------------------------
+# Клавиатуры для управления записями пользователя.
+# ---------------------------------------------------------------------------
+
+
+def build_my_bookings_keyboard(bookings: list[dict]) -> InlineKeyboardMarkup:
+    """
+    Строит клавиатуру с кнопками управления для каждой записи пользователя.
+
+    Параметр bookings: список словарей из find_user_bookings():
+        [
+            {"sheet": "Вторник", "date": "20.10.2026", "time": "17:00 — 17:15", "header_row": 6},
+            ...
+        ]
+    """
+    builder = InlineKeyboardBuilder()
+
+    for booking in bookings:
+        sheet = booking["sheet"]
+        time = booking["time"]
+        header_row = booking["header_row"]
+
+        # Кнопка отмены записи
+        builder.button(
+            text=f"❌ Отменить ({sheet}, {time})",
+            callback_data=f"{CANCEL_PREFIX}:{sheet}|{header_row}|{time}"
+        )
+
+    # Кнопка возврата в главное меню
+    builder.button(text="📅 Вернуться к записи", callback_data=BACK_TO_DAYS)
+
+    builder.adjust(1)
     return builder.as_markup()

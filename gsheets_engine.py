@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import threading
+import time
+from typing import Callable, TypeVar
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -25,6 +27,42 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar('T')
+
+# Максимальное количество повторных попыток для сетевых операций
+MAX_RETRIES: int = 3
+# Задержка между попытками (в секундах)
+RETRY_DELAY: float = 1.0
+
+
+def _retry_on_network_error(func: Callable[..., T], *args, **kwargs) -> T:
+    """
+    Выполняет функцию с повторными попытками при сетевых ошибках.
+
+    Перечисленные исключения считаются временными и вызывают повтор:
+      - gspread.exceptions.APIError (ошибки API Google)
+      - gspread.exceptions.GSpreadException (общие ошибки gspread)
+      - TimeoutError (таймаут)
+    Другие исключения пробрасываются без повторов.
+    """
+    last_exception = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except (gspread.exceptions.APIError, gspread.exceptions.GSpreadException, TimeoutError) as e:
+            last_exception = e
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(f"Попытка {attempt + 1}/{MAX_RETRIES} не удалась: {e}. Повтор через {RETRY_DELAY} сек...")
+                time.sleep(RETRY_DELAY)
+            else:
+                logger.error(f"Все {MAX_RETRIES} попыток не удались. Последняя ошибка: {e}")
+        except Exception as e:
+            # Для других исключений не делаем retry
+            raise
+
+    raise ExcelEngineError(f"Не удалось выполнить операцию после {MAX_RETRIES} попыток: {last_exception}") from last_exception
 
 
 class ExcelEngineError(Exception):
@@ -39,7 +77,7 @@ _FILE_LOCK = threading.Lock()
 def _get_client():
     global _client
     if _client is None:
-        try:
+        def _create_client():
             # На Amvera ключ сервисного аккаунта передаётся через переменную
             # окружения GOOGLE_CREDENTIALS_JSON (JSON-строка целиком).
             # Локально (переменной нет) по-прежнему читаем файл
@@ -55,7 +93,12 @@ def _get_client():
                     SERVICE_ACCOUNT_FILE,
                     scopes=["https://www.googleapis.com/auth/spreadsheets"],
                 )
-            _client = gspread.authorize(creds)
+            return gspread.authorize(creds)
+
+        try:
+            _client = _retry_on_network_error(_create_client)
+        except ExcelEngineError:
+            raise
         except Exception as error:
             raise ExcelEngineError(
                 f"Не удалось авторизоваться в Google Sheets: {error}"
@@ -66,9 +109,14 @@ def _get_client():
 def _get_spreadsheet():
     global _spreadsheet
     if _spreadsheet is None:
-        try:
+        def _open_spreadsheet():
             client = _get_client()
-            _spreadsheet = client.open_by_key(SPREADSHEET_ID)
+            return client.open_by_key(SPREADSHEET_ID)
+
+        try:
+            _spreadsheet = _retry_on_network_error(_open_spreadsheet)
+        except ExcelEngineError:
+            raise
         except Exception as error:
             raise ExcelEngineError(
                 f"Не удалось открыть Google Таблицу: {error}"
@@ -77,10 +125,16 @@ def _get_spreadsheet():
 
 
 def _open_worksheet(sheet_name):
+    def _get_worksheet():
+        spreadsheet = _get_spreadsheet()
+        return spreadsheet.worksheet(sheet_name)
+
     try:
-        return _get_spreadsheet().worksheet(sheet_name)
+        return _retry_on_network_error(_get_worksheet)
     except gspread.WorksheetNotFound:
         raise ExcelEngineError(f"Лист '{sheet_name}' не найден в Google Таблице.")
+    except ExcelEngineError:
+        raise
     except Exception as error:
         raise ExcelEngineError(
             f"Ошибка при открытии листа '{sheet_name}': {error}"
@@ -155,8 +209,14 @@ def _parse_slots(worksheet):
     """Парсит лист и возвращает список слотов (та же структура, что в excel_engine.py)."""
     slots = []
     row = FIRST_SLOT_ROW
+
+    def _get_values():
+        return worksheet.get_all_values(value_render_option="FORMULA")
+
     try:
-        all_values = worksheet.get_all_values(value_render_option="FORMULA")
+        all_values = _retry_on_network_error(_get_values)
+    except ExcelEngineError:
+        raise
     except Exception as error:
         raise ExcelEngineError(f"Не удалось прочитать лист: {error}") from error
 
@@ -274,11 +334,15 @@ def book_slot(sheet, header_row, nickname, tasks=0):
                 return False
 
             # Слот свободен: пишем ник в первую пустую строку блока (колонка B).
-            worksheet.update_cell(first_empty_row, NAME_COLUMN, nickname)
+            def _update_nickname():
+                worksheet.update_cell(first_empty_row, NAME_COLUMN, nickname)
+            _retry_on_network_error(_update_nickname)
 
             # Если указано количество задач — пишем его в колонку C (TASKS_COLUMN).
             if 1 <= tasks <= MAX_TASKS:
-                worksheet.update_cell(first_empty_row, TASKS_COLUMN, tasks)
+                def _update_tasks():
+                    worksheet.update_cell(first_empty_row, TASKS_COLUMN, tasks)
+                _retry_on_network_error(_update_tasks)
 
             return True
         except ExcelEngineError:
@@ -339,9 +403,11 @@ def _clear_slot_students(worksheet, header_row):
         # Очищаем найденные ячейки (пишем пустую строку вместо ника).
         # ВАЖНО: в gspread 6.x batch_update принимает список СЛОВАРЕЙ
         # {"range": ..., "values": ...}, а не кортежей (как в 5.x).
-        worksheet.batch_update(
-            [{"range": f"B{row}", "values": [[""]]} for row in cells_to_clear]
-        )
+        def _clear_cells():
+            worksheet.batch_update(
+                [{"range": f"B{row}", "values": [[""]]} for row in cells_to_clear]
+            )
+        _retry_on_network_error(_clear_cells)
     return removed
 
 
@@ -451,7 +517,9 @@ def update_slot_time(sheet, header_row, new_time):
                 return False
 
             # Пишем новое время обычным текстом в колонку C строки-заголовка.
-            worksheet.update_cell(header_row, TIME_COLUMN, new_time)
+            def _update_time():
+                worksheet.update_cell(header_row, TIME_COLUMN, new_time)
+            _retry_on_network_error(_update_time)
             return True
         except ExcelEngineError:
             raise
@@ -509,6 +577,128 @@ def find_user_bookings(nickname):
         except Exception as error:
             raise ExcelEngineError(
                 f"Ошибка при поиске записей пользователя: {error}"
+            ) from error
+
+
+def get_statistics():
+    """Возвращает статистику по расписанию для администратора.
+
+    Возвращает словарь:
+        {
+            "total_records": int,  # всего записей
+            "total_slots": int,    # всего слотов
+            "free_slots": int,     # свободных слотов
+            "occupied_slots": int, # занятых слотов
+            "days": [              # статистика по дням
+                {
+                    "sheet": "Вторник",
+                    "date": "20.10.2026",
+                    "total_slots": 8,
+                    "free_slots": 3,
+                    "occupied_slots": 5,
+                    "total_students": 5
+                },
+                ...
+            ]
+        }
+    """
+    with _FILE_LOCK:
+        try:
+            total_records = 0
+            total_slots = 0
+            free_slots = 0
+            occupied_slots = 0
+            day_stats = []
+
+            for worksheet in _get_spreadsheet().worksheets():
+                date_text = _compute_date(worksheet, worksheet.title)
+                if date_text is None:
+                    continue  # не день расписания
+
+                slots = _parse_slots(worksheet)
+                day_free = sum(1 for s in slots if s["free"])
+                day_occupied = sum(1 for s in slots if not s["free"])
+                day_students = sum(len(s["students"]) for s in slots)
+
+                day_stats.append({
+                    "sheet": worksheet.title,
+                    "date": date_text,
+                    "total_slots": len(slots),
+                    "free_slots": day_free,
+                    "occupied_slots": day_occupied,
+                    "total_students": day_students
+                })
+
+                total_records += day_students
+                total_slots += len(slots)
+                free_slots += day_free
+                occupied_slots += day_occupied
+
+            return {
+                "total_records": total_records,
+                "total_slots": total_slots,
+                "free_slots": free_slots,
+                "occupied_slots": occupied_slots,
+                "days": day_stats
+            }
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Ошибка при получении статистики: {error}"
+            ) from error
+
+
+def cancel_booking(sheet: str, header_row: int, nickname: str) -> bool:
+    """Отменяет запись пользователя на конкретный слот.
+
+    Параметры:
+        sheet      — имя листа-дня,
+        header_row — номер строки блока слота,
+        nickname   — ник пользователя для удаления.
+
+    Возвращает True при успехе, False если запись не найдена или некорректный слот.
+    """
+    with _FILE_LOCK:
+        try:
+            worksheet = _open_worksheet(sheet)
+
+            if not _validate_header_row(worksheet, header_row):
+                return False
+
+            # Читаем блок слота
+            body_range = f"B{header_row + 1}:B{header_row + SLOT_STEP - 1}"
+            try:
+                body_cells = worksheet.range(body_range)
+            except Exception:
+                body_cells = []
+
+            nickname_lower = nickname.strip().lower()
+            found = False
+            row_to_clear = None
+
+            for idx, cell in enumerate(body_cells):
+                student_value = cell.value
+                if student_value and str(student_value).strip().lower() == nickname_lower:
+                    found = True
+                    row_to_clear = header_row + 1 + idx
+                    break
+
+            if not found:
+                return False
+
+            # Очищаем ячейку
+            def _clear_cell():
+                worksheet.update_cell(row_to_clear, NAME_COLUMN, "")
+            _retry_on_network_error(_clear_cell)
+
+            # Инвалидация кэша (если будет добавлен)
+            return True
+        except ExcelEngineError:
+            raise
+        except Exception as error:
+            raise ExcelEngineError(
+                f"Ошибка при отмене записи '{sheet}': {error}"
             ) from error
 
 

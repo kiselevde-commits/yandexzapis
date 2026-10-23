@@ -1,9 +1,21 @@
 # --- Python ---
 venv/
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# --- Виртуальное окружение ---
+.venv/
+env/
+ENV/
 
 # --- Файлы данных / Excel ---
 *.xlsx
+*.db
+*.sqlite
+*.sqlite3
 
 # --- Текстовые файлы (кроме README и requirements.txt) ---
 *.txt
@@ -23,3 +35,13 @@ apply_*.py
 # --- Секреты ---
 avid-heading-344320-a92c26eac17f.json
 admin_ids.json
+.env
+
+# --- Логи ---
+*.log
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo

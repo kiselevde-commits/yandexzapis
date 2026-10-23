@@ -1,4 +1,16 @@
+# Основные зависимости бота
 aiogram>=3.0,<4.0
 openpyxl>=3.1,<4.0
+
+# PostgreSQL (asyncpg - асинхронный драйвер)
+asyncpg>=0.29,<1.0
+
+# Веб-сервер для healthcheck (Render)
+flask>=3.0,<4.0
+
+# Google Sheets (опционально, для синхронизации)
 gspread>=6.0,<7.0
 google-auth>=2.0,<3.0
+
+# Для работы с .env файлами
+python-dotenv>=1.0,<2.0

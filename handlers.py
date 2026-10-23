@@ -1,14 +1,14 @@
 # handlers.py — модуль обработки всех событий бота: команд, состояний (FSM) и нажатий кнопок.
 #
-# Здесь «мозг» бота: этот файл соединяет gsheets_engine.py (данные), keyboards.py (кнопки)
+# Здесь «мозг» бота: этот файл соединяет postgres_engine.py (данные), keyboards.py (кнопки)
 # и aiogram (приём сообщений и ответы).
 #
 # Поток работы бота:
-#   /start → список ДНЕЙ (листов) → выбор дня → список СЛОТОВ этого дня →
-#   выбор свободного слота → ввод ника → запись в Google Таблицу → возврат к списку дней.
+#   /start → список ДНЕЙ → выбор дня → список СЛОТОВ этого дня →
+#   выбор свободного слота → ввод ника → запись в базу PostgreSQL → возврат к списку дней.
 
-import asyncio  # нужен, чтобы выполнять работу с таблицей в отдельном потоке (to_thread)
 import json     # для сохранения/загрузки списка администраторов
+import logging
 import os       # для проверки существования файла
 
 from aiogram import F, Router
@@ -17,15 +17,20 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
+logger = logging.getLogger(__name__)
+
 # Настройки администраторов (кто имеет доступ к админ-меню).
+from commands import set_admin_commands_for_chat
 from config import ADMIN_ALLOW_CHAT_ADMINS, ADMIN_IDS, ADMIN_IDS_FILE
-from gsheets_engine import (
+from postgres_engine import (
     ExcelEngineError,
     book_slot,
+    cancel_booking,
     find_user_bookings,
     get_all_records,
     get_available_days,
     get_slots_for_day,
+    get_statistics,
     reset_all_slots,
     reset_slot,
     update_slot_time,
@@ -39,9 +44,12 @@ from keyboards import (
     ADMIN_PREFIX,
     ADMIN_RESET_ALL,
     ADMIN_RESET_CHOOSE,
+    ADMIN_STATS,
     ADMIN_VIEW_RECORDS,
     BACK_TO_DAYS,
+    CANCEL_PREFIX,
     DAY_PREFIX,
+    EDIT_TASKS_PREFIX,
     OCCUPIED_DATA,
     SLOT_PREFIX,
     TASKS_CANCEL,
@@ -51,6 +59,7 @@ from keyboards import (
     build_admin_menu_keyboard,
     build_admin_slots_keyboard,
     build_days_keyboard,
+    build_my_bookings_keyboard,
     build_slots_keyboard,
     build_tasks_keyboard,
 )
@@ -66,44 +75,54 @@ EXCEL_ERROR_TEXT = (
 
 
 # ---------------------------------------------------------------------------
-# Безопасные асинхронные обёртки вокруг блокирующих функций Excel.
-# openpyxl работает синхронно; чтобы бот не «замирал» для других пользователей,
-# выносим работу в отдельный поток через asyncio.to_thread.
+# Безопасные асинхронные обёртки функций PostgreSQL.
+# postgres_engine.py уже асинхронный, поэтому просто вызываем функции напрямую
+# и ловим исключения DatabaseError.
 # ---------------------------------------------------------------------------
 
+
 async def _get_days_safe() -> list[dict]:
-    return await asyncio.to_thread(get_available_days)
+    return await get_available_days()
 
 
 async def _get_slots_safe(sheet: str) -> list[dict]:
-    return await asyncio.to_thread(get_slots_for_day, sheet)
+    return await get_slots_for_day(sheet)
 
 
-async def _book_slot_safe(sheet: str, header_row: int, nickname: str) -> bool:
-    return await asyncio.to_thread(book_slot, sheet, header_row, nickname)
+async def _book_slot_safe(sheet: str, header_row: int, nickname: str, tasks: int = 0) -> bool:
+    return await book_slot(sheet, header_row, nickname, tasks)
 
 
 async def _find_user_bookings_safe(nickname: str) -> list[dict]:
-    """Асинхронная обёртка для find_user_bookings (в отдельном потоке)."""
-    return await asyncio.to_thread(find_user_bookings, nickname)
+    """Асинхронная обёртка для find_user_bookings."""
+    return await find_user_bookings(nickname)
 
 
-# Асинхронные обёртки админ-функций Excel (тоже в отдельном потоке).
+# Асинхронные обёртки админ-функций.
 async def _get_records_safe() -> list[dict]:
-    return await asyncio.to_thread(get_all_records)
+    return await get_all_records()
 
 
 async def _reset_all_safe() -> int:
-    return await asyncio.to_thread(reset_all_slots)
+    return await reset_all_slots()
 
 
 async def _reset_slot_safe(sheet: str, header_row: int) -> int:
-    return await asyncio.to_thread(reset_slot, sheet, header_row)
+    return await reset_slot(sheet, header_row)
 
 
 async def _update_time_safe(sheet: str, header_row: int, new_time: str) -> bool:
-    return await asyncio.to_thread(update_slot_time, sheet, header_row, new_time)
+    return await update_slot_time(sheet, header_row, new_time)
 
+
+async def _cancel_booking_safe(sheet: str, header_row: int, nickname: str) -> bool:
+    """Асинхронная обёртка для cancel_booking."""
+    return await cancel_booking(sheet, header_row, nickname)
+
+
+async def _get_statistics_safe():
+    """Асинхронная обёртка для get_statistics."""
+    return await get_statistics()
 
 # ---------------------------------------------------------------------------
 # Проверка прав администратора.
@@ -196,6 +215,8 @@ class BookingStates(StatesGroup):
     waiting_for_nickname = State()
     # Пользователь ввёл ник, бот ждёт выбора количества задач.
     waiting_for_tasks = State()
+    # Пользователь ищет свои записи через /mybookings.
+    waiting_for_search_nickname = State()
 
 
 # FSM-состояния админ-меню.
@@ -204,6 +225,73 @@ class AdminStates(StatesGroup):
     waiting_for_new_time = State()
     # Админ вводит Telegram ID нового администратора.
     waiting_for_new_admin_id = State()
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции.
+# ---------------------------------------------------------------------------
+
+
+def _safe_parse_callback(callback_data: str, expected_parts: int) -> list[str] | None:
+    """
+    Безопасно парсит callback_data, возвращает части или None при ошибке.
+
+    Параметры:
+        callback_data    — строка callback_data из кнопки
+        expected_parts   — минимальное количество частей после split(":")
+
+    Возвращает список частей или None при ошибке парсинга.
+    """
+    try:
+        parts = callback_data.split(":")
+        if len(parts) < expected_parts:
+            return None
+        return parts
+    except Exception:
+        return None
+
+
+def _validate_time_format(time_str: str) -> bool:
+    """
+    Проверяет формат времени: ЧЧ:ММ — ЧЧ:ММ
+
+    Параметры:
+        time_str — строка с временем
+
+    Возвращает True если формат корректен, иначе False.
+    """
+    import re
+
+    pattern = r'^\d{1,2}:\d{2}\s*—\s*\d{1,2}:\d{2}$'
+    if not re.match(pattern, time_str):
+        return False
+
+    # Парсим и проверяем корректность времени
+    parts = time_str.split('—')
+    for part in parts:
+        try:
+            hours, minutes = map(int, part.strip().split(':'))
+            if hours < 0 or hours > 23 or minutes < 0 or minutes > 59:
+                return False
+        except (ValueError, IndexError):
+            return False
+
+    return True
+
+
+def _is_not_command(message: Message) -> bool:
+    """
+    Фильтр для FSM-обработчиков текста: пропускает только НЕ-команды
+    (сообщение, не начинающееся с «/»).
+
+    Зачем это нужно: обработчики состояний (ввод ника, ввод нового времени,
+    ввод ID админа) зарегистрированы в этом файле. Без такого фильтра команда
+    /admin — или /start, /book, /help, /mybookings, — отправленная из состояния,
+    перехватывалась бы как обычный текст (например, «/admin» сохранялся как ник
+    ученика). Теперь команды «проскакивают» эти обработчики и доходят до своих
+    Command-handlers независимо от порядка регистрации.
+    """
+    return not (message.text or "").startswith("/")
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +306,21 @@ async def _send_days(target, edit: bool = False, state: FSMContext | None = None
     """
     try:
         days = await _get_days_safe()
-    except ExcelEngineError:
+    except ExcelEngineError as e:
+        logger.error(f"Ошибка при получении дней: {e}")
         if edit:
             await target.edit_text(EXCEL_ERROR_TEXT)
         else:
             await target.answer(EXCEL_ERROR_TEXT)
+        if state is not None:
+            await state.clear()
+        return
+    except Exception as e:
+        logger.critical(f"Неожиданная ошибка при получении дней: {e}", exc_info=True)
+        if edit:
+            await target.edit_text("⚠️ Произошла непредвиденная ошибка. Попробуй позже.")
+        else:
+            await target.answer("⚠️ Произошла непредвиденная ошибка. Попробуй позже.")
         if state is not None:
             await state.clear()
         return
@@ -250,10 +348,12 @@ async def _send_days(target, edit: bool = False, state: FSMContext | None = None
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     """Обработчик /start: приветствие и показ списка дней."""
+    logger.info(f"Пользователь {message.from_user.id} ({message.from_user.username}) запустил /start")
     await state.clear()
     await message.answer(
-        "👋 Привет! Я помогу записаться на отслушку по олимпиадной математике.\n"
-        "Выбери день, а затем удобное время из свободных слотов."
+        "👋 Привет! Я помогу записаться на отлушку по олимпиадной математике.\n"
+        "Выбери день, а затем удобное время из свободных слотов.\n\n"
+        "ℹ️ Нажми /help для справки по командам."
     )
     await _send_days(message)
 
@@ -261,7 +361,151 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @router.message(Command("book"))
 async def cmd_book(message: Message) -> None:
     """Обработчик /book: сразу показывает список дней для записи."""
+    logger.info(f"Пользователь {message.from_user.id} ({message.from_user.username}) запустил /book")
     await _send_days(message)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    """Обработчик /help: показывает справку по командам."""
+    logger.info(f"Пользователь {message.from_user.id} ({message.from_user.username}) запустил /help")
+    help_text = (
+        "📚 *Справка по командам:*\n\n"
+        "*Для учеников:*\n"
+        "/start — начать запись на отлушку\n"
+        "/book — быстрая запись на слот\n"
+        "/mybookings — показать мои записи\n"
+        "/help — эта справка\n\n"
+        "*Для администраторов:*\n"
+        "/admin — меню администратора\n\n"
+        "📝 *Как записаться:*\n"
+        "1. Нажми /start\n"
+        "2. Выбери день\n"
+        "3. Выбери свободное время\n"
+        "4. Введи свой ник\n"
+        "5. Укажи количество задач (1-4)"
+    )
+    await message.answer(help_text, parse_mode="Markdown")
+
+
+@router.message(Command("mybookings"))
+async def cmd_mybookings(message: Message, state: FSMContext) -> None:
+    """Обработчик /mybookings: показывает записи пользователя."""
+    logger.info(f"Пользователь {message.from_user.id} ({message.from_user.username}) запустил /mybookings")
+    await state.clear()
+
+    # Просим ввести ник для поиска записей
+    await message.answer(
+        "📋 Введи свой ник или имя, чтобы найти свои записи:"
+    )
+    await state.set_state(BookingStates.waiting_for_search_nickname)
+
+
+@router.message(BookingStates.waiting_for_search_nickname, _is_not_command)
+async def on_mybookings_nickname(message: Message, state: FSMContext) -> None:
+    """Принимает ник и показывает записи пользователя."""
+    nickname = (message.text or "").strip()
+    if not nickname:
+        await message.answer("Пожалуйста, введи ник текстом (например: @ivan).")
+        return
+
+    logger.info(f"Пользователь {message.from_user.id} ищет записи для ника: {nickname}")
+
+    try:
+        bookings = await _find_user_bookings_safe(nickname)
+    except ExcelEngineError as e:
+        logger.error(f"Ошибка при поиске записей для {nickname}: {e}")
+        await message.answer(EXCEL_ERROR_TEXT)
+        await state.clear()
+        return
+    except Exception as e:
+        logger.critical(f"Неожиданная ошибка при поиске записей для {nickname}: {e}", exc_info=True)
+        await message.answer("⚠️ Произошла ошибка. Попробуй позже.")
+        await state.clear()
+        return
+
+    if not bookings:
+        await message.answer(
+            f"ℹ️ Для ника «{nickname}» записей не найдено.\n\n"
+            "Хочешь записаться? Нажми /start"
+        )
+        await state.clear()
+        return
+
+    # Сохраняем ник для последующей отмены
+    await state.update_data(nickname=nickname)
+
+    lines = [
+        f"📋 **Записи для {nickname}:**\n",
+    ]
+    for booking in bookings:
+        lines.append(f"  • {booking['sheet']} ({booking['date']}), {booking['time']}")
+    lines.append("")
+
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+    await message.answer(
+        "Выбери действие:",
+        reply_markup=build_my_bookings_keyboard(bookings)
+    )
+
+
+@router.callback_query(F.data.startswith(f"{CANCEL_PREFIX}:"))
+async def on_cancel_booking(callback: CallbackQuery, state: FSMContext) -> None:
+    """Обрабатывает отмену записи."""
+    payload = callback.data.split(":", 1)[1]
+    sheet, header_row_text, time = payload.split("|", 2)
+    header_row = int(header_row_text)
+
+    data = await state.get_data()
+    nickname = data.get("nickname")
+
+    if not nickname:
+        await callback.answer("⚠️ Сессия истекла. Начни заново с /mybookings", show_alert=True)
+        return
+
+    logger.info(f"Пользователь {callback.from_user.id} отменяет запись: {sheet} {time}")
+
+    try:
+        success = await _cancel_booking_safe(sheet, header_row, nickname)
+    except ExcelEngineError as e:
+        logger.error(f"Ошибка при отмене записи: {e}")
+        await callback.answer(EXCEL_ERROR_TEXT, show_alert=True)
+        return
+    except Exception as e:
+        logger.critical(f"Неожиданная ошибка при отмене записи: {e}", exc_info=True)
+        await callback.answer("⚠️ Произошла ошибка. Попробуй позже.", show_alert=True)
+        return
+
+    if success:
+        await callback.message.edit_text(
+            f"✅ Запись на «{sheet}», {time} отменена.\n\n"
+            "Мои записи:"
+        )
+        # Показать обновлённый список
+        try:
+            bookings = await _find_user_bookings_safe(nickname)
+            if bookings:
+                lines = [f"📋 **Записи для {nickname}:**\n"]
+                for booking in bookings:
+                    lines.append(f"  • {booking['sheet']} ({booking['date']}), {booking['time']}")
+                lines.append("")
+                await callback.message.answer("\n".join(lines), parse_mode="Markdown")
+                await callback.message.answer(
+                    "Выбери действие:",
+                    reply_markup=build_my_bookings_keyboard(bookings)
+                )
+            else:
+                await callback.message.answer(
+                    f"ℹ️ Все записи для {nickname} отменены.\n\n"
+                    "Хочешь записаться? Нажми /start"
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении списка записей: {e}")
+            await callback.message.answer("⚠️ Не удалось обновить список записей.")
+    else:
+        await callback.answer("⚠️ Не удалось отменить запись. Возможно, запись уже была удалена.", show_alert=True)
+
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +535,23 @@ async def on_day_chosen(callback: CallbackQuery) -> None:
     Нажата кнопка дня. Показываем все слоты этого дня.
     callback_data имеет вид "day:Вторник".
     """
-    sheet = callback.data.split(":", 1)[1]  # имя листа-дня
+    parts = _safe_parse_callback(callback.data, 2)
+    if not parts:
+        await callback.answer("⚠️ Сообщение устарело. Начните заново.", show_alert=True)
+        return
+
+    sheet = parts[1]  # имя листа-дня
+    logger.info(f"Пользователь {callback.from_user.id} выбрал день: {sheet}")
 
     try:
         slots = await _get_slots_safe(sheet)
-    except ExcelEngineError:
+    except ExcelEngineError as e:
+        logger.error(f"Ошибка при получении слотов для {sheet}: {e}")
         await callback.answer(EXCEL_ERROR_TEXT, show_alert=True)
+        return
+    except Exception as e:
+        logger.critical(f"Неожиданная ошибка при получении слотов для {sheet}: {e}", exc_info=True)
+        await callback.answer("⚠️ Произошла ошибка. Попробуй позже.", show_alert=True)
         return
 
     if not slots:
@@ -318,9 +573,18 @@ async def on_slot_chosen(callback: CallbackQuery, state: FSMContext) -> None:
     callback_data имеет вид "slot:Вторник|6|17:00 — 17:15"
     (лист | номер строки блока | текст времени для показа).
     """
-    payload = callback.data.split(":", 1)[1]  # "Вторник|6|17:00 — 17:15"
-    sheet, header_row_text, time = payload.split("|", 2)
-    header_row = int(header_row_text)  # номер строки блока — надёжный идентификатор слота
+    parts = _safe_parse_callback(callback.data, 2)
+    if not parts:
+        await callback.answer("⚠️ Сообщение устарело. Начните заново.", show_alert=True)
+        return
+
+    payload = parts[1]  # "Вторник|6|17:00 — 17:15"
+    try:
+        sheet, header_row_text, time = payload.split("|", 2)
+        header_row = int(header_row_text)
+    except (ValueError, IndexError):
+        await callback.answer("⚠️ Некорректные данные кнопки. Начните заново.", show_alert=True)
+        return
 
     # Сохраняем выбор в FSM, чтобы использовать после ввода ника.
     await state.update_data(sheet=sheet, header_row=header_row, time=time)
@@ -337,7 +601,7 @@ async def on_slot_chosen(callback: CallbackQuery, state: FSMContext) -> None:
 # Ввод ника (текстовое сообщение в состоянии waiting_for_nickname).
 # ---------------------------------------------------------------------------
 
-@router.message(BookingStates.waiting_for_nickname)
+@router.message(BookingStates.waiting_for_nickname, _is_not_command)
 async def on_nickname_received(message: Message, state: FSMContext) -> None:
     """Принимает ник, проверяет двойную запись и просит указать количество задач."""
     data = await state.get_data()
@@ -347,39 +611,22 @@ async def on_nickname_received(message: Message, state: FSMContext) -> None:
 
     nickname = (message.text or "").strip()
     if not nickname:
+        logger.warning(f"Пользователь {message.from_user.id} отправил пустой ник")
         await message.answer("Пожалуйста, введи ник текстом (например: @ivan).")
+        return
+
+    if len(nickname) > 50:
+        logger.warning(f"Пользователь {message.from_user.id} отправил слишком длинный ник: {len(nickname)} символов")
+        await message.answer("⚠️ Ник слишком длинный (максимум 50 символов). Попробуй короче.")
         return
 
     # Сохраняем ник в состоянии.
     await state.update_data(nickname=nickname)
+    logger.info(f"Пользователь {message.from_user.id} ввёл ник: {nickname}")
 
-    # Проверяем, не записан ли этот пользователь уже куда-то.
-    try:
-        existing = await _find_user_bookings_safe(nickname)
-    except ExcelEngineError:
-        await message.answer(EXCEL_ERROR_TEXT)
-        return
-
-    if existing:
-        lines = [
-            f"⚠️ Ты ({nickname}) уже записан(а) на отслушку.",
-            "",
-            "Вот твои текущие записи:",
-        ]
-        for rec in existing:
-            lines.append(f"  • {rec['sheet']} ({rec['date']}), {rec['time']}")
-        lines += [
-            "",
-            "Если хочешь изменить запись — напиши администратору.",
-            "",
-            "Выбери другой день, чтобы вернуться к выбору:",
-        ]
-        await state.clear()
-        await message.answer("\n".join(lines))
-        await _send_days(message)
-        return
-
-    # Всё хорошо — просим указать количество задач.
+    # Сразу просим указать количество задач.
+    # (Проверка «уже записан» намеренно убрана по требованию заказчика:
+    #  после ввода ника бот не должен возвращать пользователя к выбору дня.)
     await state.set_state(BookingStates.waiting_for_tasks)
 
     await message.answer(
@@ -427,7 +674,7 @@ async def on_tasks_chosen(callback: CallbackQuery, state: FSMContext) -> None:
 
     # Бронируем слот с указанием количества задач.
     try:
-        success = await asyncio.to_thread(book_slot, sheet, header_row, nickname, tasks)
+        success = await _book_slot_safe(sheet, header_row, nickname, tasks)
     except ExcelEngineError:
         await callback.message.edit_text(EXCEL_ERROR_TEXT)
         await state.clear()
@@ -435,19 +682,22 @@ async def on_tasks_chosen(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if success:
+        # Запись успешно создана: показываем итог и НЕ возвращаем пользователя
+        # к экрану «Выбери день занятия» (раньше здесь был вызов _send_days,
+        # из-за которого бот снова запрашивал выбор дня).
         await callback.message.edit_text(
             f"✅ Готово! Ты записан(а) на «{sheet}», {time}.\n"
-            f"   Указано задач: {tasks}.\n"
-            "Если что-то изменится — напиши администратору.\n\n"
-            "Другие дни:"
+            f"   Указано задач: {tasks}.\n\n"
+            "Если захочешь записаться ещё — нажми /start.\n"
+            "Если что-то изменится — напиши администратору."
         )
-        await _send_days(callback.message, edit=True)
     else:
+        # Слот заняли, пока пользователь вводил данные. Сообщаем об этом и
+        # предлагаем вернуться к выбору через /start (без показа дней сразу).
         await callback.message.edit_text(
-            "⚠️ Увы, этот слот только что заняли. "
-            "Посмотри свободные варианты заново:"
+            "⚠️ Увы, этот слот только что заняли.\n\n"
+            "Чтобы выбрать другой свободный слот, нажми /start."
         )
-        await _send_days(callback.message, edit=True)
 
     await state.clear()
     await callback.answer()
@@ -501,7 +751,43 @@ async def on_admin_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1) Просмотр — кто записался.
+# 1) Статистика.
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == ADMIN_STATS)
+async def on_admin_stats(callback: CallbackQuery) -> None:
+    """Кнопка «📊 Статистика»: показываем общую статистику."""
+    try:
+        stats = await _get_statistics_safe()
+    except ExcelEngineError:
+        await callback.answer(EXCEL_ERROR_TEXT, show_alert=True)
+        return
+
+    lines = [
+        "📊 **Статистика по расписанию:**\n\n",
+        f"📈 Всего записей: {stats['total_records']}\n",
+        f"🔢 Всего слотов: {stats['total_slots']}\n",
+        f"✅ Свободных слотов: {stats['free_slots']}\n",
+        f"🔒 Занятых слотов: {stats['occupied_slots']}\n\n",
+        "**По дням:**\n",
+    ]
+
+    for day in stats['days']:
+        lines.append(f"📅 {day['sheet']} ({day['date']}):")
+        lines.append(f"   • Слотов: {day['total_slots']} (свободно: {day['free_slots']}, занято: {day['occupied_slots']})")
+        lines.append(f"   • Учеников: {day['total_students']}")
+        lines.append("")
+
+    text = "\n".join(lines)
+
+    await callback.message.edit_text(
+        text, reply_markup=build_admin_menu_keyboard(), parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# 2) Просмотр — кто записался.
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == ADMIN_VIEW_RECORDS)
@@ -710,7 +996,7 @@ async def on_admin_slot_edit(callback: CallbackQuery, state: FSMContext) -> None
     await callback.answer()
 
 
-@router.message(AdminStates.waiting_for_new_time)
+@router.message(AdminStates.waiting_for_new_time, _is_not_command)
 async def on_admin_new_time_received(message: Message, state: FSMContext) -> None:
     """Принимает новое время слота и сохраняет его в Excel."""
     # Проверяем, что отправитель — всё ещё администратор (защита от подмены).
@@ -722,6 +1008,14 @@ async def on_admin_new_time_received(message: Message, state: FSMContext) -> Non
     if not new_time:
         await message.answer(
             "Пожалуйста, введи время текстом (например: 17:00 — 17:15)."
+        )
+        return
+
+    if not _validate_time_format(new_time):
+        await message.answer(
+            "⚠️ Некорректный формат времени.\n"
+            "Пример: 17:00 — 17:15\n"
+            "Часы: 0-23, минуты: 0-59"
         )
         return
 
@@ -783,7 +1077,7 @@ async def on_admin_add(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.message(AdminStates.waiting_for_new_admin_id)
+@router.message(AdminStates.waiting_for_new_admin_id, _is_not_command)
 async def on_new_admin_id_received(message: Message, state: FSMContext) -> None:
     """Принимает Telegram ID нового администратора и добавляет его."""
     # Проверяем права — только админ может добавлять админов.
@@ -863,6 +1157,10 @@ async def on_new_admin_id_received(message: Message, state: FSMContext) -> None:
     dynamic = _load_dynamic_admins()
     dynamic.append(target_user_id)
     _save_dynamic_admins(dynamic)
+
+    # Сразу показываем новому админу команду /admin в кнопке меню Telegram,
+    # чтобы не приходилось перезапускать бота.
+    await set_admin_commands_for_chat(message.bot, target_user_id)
 
     # Пытаемся узнать имя пользователя для красивого ответа.
     user_name = str(target_user_id)
