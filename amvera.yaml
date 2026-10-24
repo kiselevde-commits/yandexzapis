@@ -14,6 +14,8 @@ run:
       value: ""
     - name: DATABASE_URL
       value: ""
+    - name: GOOGLE_CREDENTIALS_JSON
+      value: ""
     - name: ADMIN_IDS_FILE
       value: "/data/admin_ids.json"
     - name: DATA_DIR
