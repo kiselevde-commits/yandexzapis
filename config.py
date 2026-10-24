@@ -50,7 +50,13 @@ DB_PATH: Final[str] = os.environ.get("DB_PATH", _get_default_db_path())
 # URL базы данных задается переменной окружения DATABASE_URL.
 # Render автоматически создает эту переменную при добавлении PostgreSQL.
 # ---------------------------------------------------------------------------
-DATABASE_URL: Final[str] = os.environ.get("DATABASE_URL", "")
+# Игнорируем placeholder-значения (localhost и т.п.), которые могут быть
+# заданы в системе, но не являются реальным подключением к Render/Amvera.
+_raw_db_url = os.environ.get("DATABASE_URL", "").strip()
+if _raw_db_url and not _raw_db_url.startswith("postgresql://user:password@localhost"):
+    DATABASE_URL: Final[str] = _raw_db_url
+else:
+    DATABASE_URL: Final[str] = ""
 
 # ---------------------------------------------------------------------------
 # Google Таблица (архивное подключение).

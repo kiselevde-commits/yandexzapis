@@ -11,12 +11,13 @@ import asyncio
 import logging
 import os
 import random
+import socket
 import sys
 import time
 import threading
 
 from aiogram import BaseMiddleware, Bot, Dispatcher
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.exceptions import TelegramConflictError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.types import Message, CallbackQuery
 from flask import Flask
 
@@ -66,6 +67,22 @@ class RateLimitMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+def check_single_instance() -> socket.socket:
+    """
+    Проверяет, что запущен только один экземпляр бота (для локальной разработки).
+    Использует локальный TCP сокет на уникальном порту.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('127.0.0.1', 47231))  # Уникальный порт для вашего бота
+        sock.listen(1)
+        return sock
+    except OSError:
+        logger.error("❌ Бот уже запущен! Завершите предыдущий процесс.")
+        sys.exit(1)
+
+
 async def run_bot_with_retry() -> None:
     """
     Запускает бота с автоматическим переподключением при потере связи с Telegram.
@@ -88,6 +105,17 @@ async def run_bot_with_retry() -> None:
         except KeyboardInterrupt:
             logger.info("Бот остановлен пользователем (Ctrl+C).")
             break
+        except TelegramConflictError:
+            # Конфликт getUpdates — другой экземпляр бота уже опрашивает Telegram.
+            # Это происходит, если бот запущен в двух местах (локально + сервер).
+            # Ждём дольше и не увеличиваем бэкофф, чтобы не спамить.
+            logger.error(
+                "❌ Конфликт Telegram: другой экземпляр бота уже получает обновления. "
+                "Убедитесь, что бот запущен только в ОДНОМ месте (либо локально, либо на сервере). "
+                "Ожидание 30 секунд перед повторной попыткой..."
+            )
+            await asyncio.sleep(30)
+            # Не увеличиваем delay, так как это не сетевая ошибка
         except (TelegramNetworkError, TelegramServerError) as e:
             # Сетевые ошибки и ошибки сервера Telegram — пробуем переподключиться
             jitter = random.uniform(0, delay * 0.1)  # до 10% дрожи
@@ -162,6 +190,10 @@ async def main_once() -> None:
 
 
 if __name__ == "__main__":
+    # Проверка на единственный экземпляр (только для локальной разработки)
+    # На сервере (Amvera/Render) это не сработает, так как там изолированные контейнеры
+    single_instance_socket = check_single_instance()
+
     # Запускаем Flask healthcheck сервер в отдельном потоке (даемон)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
@@ -174,3 +206,9 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Критическая ошибка при работе бота: {e}", exc_info=True)
         raise
+    finally:
+        # Закрываем сокет при выходе
+        try:
+            single_instance_socket.close()
+        except Exception:
+            pass

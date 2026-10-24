@@ -51,7 +51,24 @@ def _retry_on_network_error(func: Callable[..., T], *args, **kwargs) -> T:
     for attempt in range(MAX_RETRIES):
         try:
             return func(*args, **kwargs)
-        except (gspread.exceptions.APIError, gspread.exceptions.GSpreadException, TimeoutError) as e:
+        except gspread.exceptions.APIError as e:
+            last_exception = e
+            error_code = getattr(e, 'response', None)
+            if error_code is not None:
+                status_code = getattr(error_code, 'status_code', None)
+                # Ошибки, которые НЕ стоит ретраить (клиентские ошибки)
+                if status_code in (400, 401, 403, 404):
+                    logger.error(f"Клиентская ошибка API Google (код {status_code}), повтор не поможет: {e}")
+                    raise ExcelEngineError(
+                        f"Ошибка Google API (код {status_code}): проверьте настройки доступа и ID таблицы. "
+                        f"Подробности: {e}"
+                    ) from e
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(f"Попытка {attempt + 1}/{MAX_RETRIES} не удалась (API Error): {e}. Повтор через {RETRY_DELAY} сек...")
+                time.sleep(RETRY_DELAY)
+            else:
+                logger.error(f"Все {MAX_RETRIES} попыток не удались. Последняя ошибка API: {e}")
+        except (gspread.exceptions.GSpreadException, TimeoutError) as e:
             last_exception = e
             if attempt < MAX_RETRIES - 1:
                 logger.warning(f"Попытка {attempt + 1}/{MAX_RETRIES} не удалась: {e}. Повтор через {RETRY_DELAY} сек...")
@@ -62,7 +79,10 @@ def _retry_on_network_error(func: Callable[..., T], *args, **kwargs) -> T:
             # Для других исключений не делаем retry
             raise
 
-    raise ExcelEngineError(f"Не удалось выполнить операцию после {MAX_RETRIES} попыток: {last_exception}") from last_exception
+    raise ExcelEngineError(
+        f"Не удалось выполнить операцию с Google Таблицами после {MAX_RETRIES} попыток. "
+        f"Проверьте интернет-соединение и доступность Google API. Последняя ошибка: {last_exception}"
+    ) from last_exception
 
 
 class ExcelEngineError(Exception):
@@ -101,7 +121,8 @@ def _get_client():
             raise
         except Exception as error:
             raise ExcelEngineError(
-                f"Не удалось авторизоваться в Google Sheets: {error}"
+                f"Ошибка авторизации в Google Таблицах: проверь файл ключа сервисного аккаунта "
+                f"или переменную GOOGLE_CREDENTIALS_JSON ({error})"
             ) from error
     return _client
 
@@ -118,24 +139,46 @@ def _get_spreadsheet():
         except ExcelEngineError:
             raise
         except Exception as error:
-            raise ExcelEngineError(
-                f"Не удалось открыть Google Таблицу: {error}"
-            ) from error
+            error_str = str(error).lower()
+            if "not found" in error_str or "404" in error_str:
+                raise ExcelEngineError(
+                    f"Google Таблица с ID '{SPREADSHEET_ID}' не найдена. "
+                    f"Проверь SPREADSHEET_ID в config.py и доступ сервисного аккаунта к таблице."
+                ) from error
+            elif "permission" in error_str or "403" in error_str:
+                raise ExcelEngineError(
+                    f"Нет доступа к Google Таблице. Добавь email сервисного аккаунта "
+                    f"в настройки доступа таблицы (кнопка «Поделиться» → «Редактор»)."
+                ) from error
+            else:
+                raise ExcelEngineError(
+                    f"Не удалось открыть Google Таблицу: {error}"
+                ) from error
     return _spreadsheet
 
 
 def _open_worksheet(sheet_name):
     def _get_worksheet():
         spreadsheet = _get_spreadsheet()
+        logger.debug(f"Открытие листа: {sheet_name}")
         return spreadsheet.worksheet(sheet_name)
 
     try:
         return _retry_on_network_error(_get_worksheet)
     except gspread.WorksheetNotFound:
+        logger.error(f"Лист '{sheet_name}' не найден в Google Таблице. Доступные листы будут логированы ниже.")
+        # Попытка получить список доступных листов для диагностики
+        try:
+            spreadsheet = _get_spreadsheet()
+            available_sheets = [ws.title for ws in spreadsheet.worksheets()]
+            logger.info(f"Доступные листы в таблице: {available_sheets}")
+        except Exception:
+            pass
         raise ExcelEngineError(f"Лист '{sheet_name}' не найден в Google Таблице.")
     except ExcelEngineError:
         raise
     except Exception as error:
+        logger.error(f"Ошибка при открытии листа '{sheet_name}': {error}", exc_info=True)
         raise ExcelEngineError(
             f"Ошибка при открытии листа '{sheet_name}': {error}"
         ) from error
@@ -267,16 +310,19 @@ def _parse_slots(worksheet):
 def get_available_days():
     """Возвращает список всех дней (листов) с датами из Google Таблицы."""
     try:
+        logger.debug("Получение списка доступных дней из Google Таблицы")
         worksheets = _get_spreadsheet().worksheets()
         days = []
         for ws in worksheets:
             date_text = _compute_date(ws, ws.title)
             if date_text is not None:
                 days.append({"sheet": ws.title, "date": date_text})
+        logger.info(f"Найдено дней расписания: {len(days)}")
         return days
     except ExcelEngineError:
         raise
     except Exception as error:
+        logger.error(f"Ошибка при получении списка дней: {error}", exc_info=True)
         raise ExcelEngineError(f"Ошибка при получении списка дней: {error}") from error
 
 
@@ -284,11 +330,15 @@ def get_slots_for_day(sheet):
     """Возвращает все слоты указанного дня (и свободные, и занятые)."""
     with _FILE_LOCK:
         try:
+            logger.debug(f"Получение слотов для дня: {sheet}")
             worksheet = _open_worksheet(sheet)
-            return _parse_slots(worksheet)
+            slots = _parse_slots(worksheet)
+            logger.info(f"Найдено слотов для '{sheet}': {len(slots)}")
+            return slots
         except ExcelEngineError:
             raise
         except Exception as error:
+            logger.error(f"Ошибка при получении слотов для '{sheet}': {error}", exc_info=True)
             raise ExcelEngineError(
                 f"Ошибка при получении слотов для '{sheet}': {error}"
             ) from error
@@ -298,14 +348,18 @@ def book_slot(sheet, header_row, nickname, tasks=0):
     """Записывает ученика на конкретный слот. True при успехе, False — если слот занят."""
     with _FILE_LOCK:
         try:
+            logger.debug(f"Попытка бронирования: sheet={sheet}, row={header_row}, nickname={nickname}, tasks={tasks}")
             worksheet = _open_worksheet(sheet)
 
             # Проверяем корректность номера строки блока.
             if not isinstance(header_row, int) or header_row < FIRST_SLOT_ROW:
+                logger.warning(f"Некорректный header_row: {header_row}")
                 return False
             if (header_row - FIRST_SLOT_ROW) % SLOT_STEP != 0:
+                logger.warning(f"header_row не кратен SLOT_STEP: {header_row}")
                 return False
             if _get_slot_time(worksheet, header_row) is None:
+                logger.warning(f"Нет времени в строке {header_row}")
                 return False
 
             # Читаем колонку B блока (строки header_row+1 … header_row+SLOT_STEP-1).
@@ -315,7 +369,8 @@ def book_slot(sheet, header_row, nickname, tasks=0):
             body_range = f"B{header_row + 1}:B{header_row + SLOT_STEP - 1}"
             try:
                 body_cells = worksheet.range(body_range)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Ошибка чтения диапазона {body_range}: {e}")
                 body_cells = []
 
             # Ищем первую пустую строку и одновременно проверяем, свободен ли слот.
@@ -327,10 +382,12 @@ def book_slot(sheet, header_row, nickname, tasks=0):
                         first_empty_row = header_row + 1 + idx
                 else:
                     # В блоке уже есть ученик — слот занят, бронь невозможна.
+                    logger.info(f"Слот занят: {sheet} row={header_row}, уже записан: {student_value}")
                     return False
 
             # Если пустой строки нет — весь блок занят (или сломан).
             if first_empty_row is None:
+                logger.warning(f"Нет пустых строк в блоке: {sheet} row={header_row}")
                 return False
 
             # Слот свободен: пишем ник в первую пустую строку блока (колонка B).
@@ -344,10 +401,12 @@ def book_slot(sheet, header_row, nickname, tasks=0):
                     worksheet.update_cell(first_empty_row, TASKS_COLUMN, tasks)
                 _retry_on_network_error(_update_tasks)
 
+            logger.info(f"Успешная бронь: {sheet} row={header_row}, nickname={nickname}, tasks={tasks}")
             return True
         except ExcelEngineError:
             raise
         except Exception as error:
+            logger.error(f"Ошибка при бронировании слота '{sheet}': {error}", exc_info=True)
             raise ExcelEngineError(
                 f"Ошибка при бронировании слота '{sheet}': {error}"
             ) from error
